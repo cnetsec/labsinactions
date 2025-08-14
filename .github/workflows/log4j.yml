@@ -85,7 +85,7 @@ jobs:
                   );
 
                   logger.info("Iniciando app Log4j (demo segura).");
-                  //Mensagem DIRETA (não usar "{}") para acionar o lookup em 2.14.1
+                  // Mensagem DIRETA (não usar "{}") para acionar o lookup em 2.14.1
                   logger.error(entrada);
 
                   System.out.println("APP_DONE");
@@ -98,11 +98,13 @@ jobs:
           mvn -q -DskipTests -Dlog4j.version="${LOG4J_VERSION}" package
           echo "==> log4j-core efetivo: ${LOG4J_VERSION}"
 
-      - name: (Opcional) Confirmar presença do vetor JndiLookup.class
+      - name: Confirmar presença do vetor (copiar JAR e inspecionar JndiLookup.class)
         run: |
-          mvn -q -Dlog4j.version="${LOG4J_VERSION}" \
-              dependency:get -Dartifact=org.apache.logging.log4j:log4j-core:${LOG4J_VERSION}:jar
-          JAR="$HOME/.m2/repository/org/apache/logging/log4j/log4j-core/${LOG4J_VERSION}/log4j-core-${LOG4J_VERSION}.jar"
+          # Em vez de dependency:get (que tenta puxar 'log4j-core-java9'), copiamos só o JAR alvo:
+          mvn -q org.apache.maven.plugins:maven-dependency-plugin:3.6.1:copy \
+              -Dartifact=org.apache.logging.log4j:log4j-core:${LOG4J_VERSION}:jar \
+              -DoutputDirectory=./target/deps
+          JAR="target/deps/log4j-core-${LOG4J_VERSION}.jar"
           echo "JAR: $JAR"
           (unzip -l "$JAR" | grep -q 'JndiLookup.class' && echo ">> JndiLookup PRESENTE (vetor existe)") || echo ">> JndiLookup AUSENTE"
 
