@@ -1,0 +1,177 @@
+name: "🔍 Lab Log4j — tudo em um único YML (saída em tela)"
+
+on:
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+
+jobs:
+  lab:
+    name: "${{ matrix.scenario }} — build & scan"
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - scenario: vulneravel
+            maven_profile: vulneravel
+          - scenario: corrigido
+            maven_profile: corrigido
+
+    steps:
+      - name: Checkout (repo pode estar vazio)
+        uses: actions/checkout@v4
+
+      - name: Setup Java 17 e Maven
+        run: |
+          sudo apt-get update -y
+          sudo apt-get install -y maven jq
+          java -version || true
+          mvn -v || true
+
+      - name: Criar arquivos do projeto (pom.xml e App.java)
+        run: |
+          mkdir -p src/main/java/com/example
+          cat > pom.xml <<'XML'
+          <project xmlns="http://maven.apache.org/POM/4.0.0"
+                   xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+                   xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 http://maven.apache.org/xsd/maven-4.0.0.xsd">
+            <modelVersion>4.0.0</modelVersion>
+            <groupId>com.example</groupId>
+            <artifactId>log4j-lab</artifactId>
+            <version>1.0.0</version>
+            <properties>
+              <maven.compiler.source>11</maven.compiler.source>
+              <maven.compiler.target>11</maven.compiler.target>
+              <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
+            </properties>
+            <dependencies>
+              <dependency>
+                <groupId>org.apache.logging.log4j</groupId>
+                <artifactId>log4j-api</artifactId>
+                <version>${log4j.version}</version>
+              </dependency>
+              <dependency>
+                <groupId>org.apache.logging.log4j</groupId>
+                <artifactId>log4j-core</artifactId>
+                <version>${log4j.version}</version>
+              </dependency>
+            </dependencies>
+            <build>
+              <plugins>
+                <plugin>
+                  <groupId>org.codehaus.mojo</groupId>
+                  <artifactId>exec-maven-plugin</artifactId>
+                  <version>3.1.0</version>
+                  <configuration>
+                    <mainClass>com.example.App</mainClass>
+                  </configuration>
+                </plugin>
+              </plugins>
+            </build>
+            <profiles>
+              <profile>
+                <id>vulneravel</id>
+                <properties>
+                  <log4j.version>2.14.1</log4j.version>
+                </properties>
+              </profile>
+              <profile>
+                <id>corrigido</id>
+                <properties>
+                  <log4j.version>2.17.1</log4j.version>
+                </properties>
+              </profile>
+            </profiles>
+          </project>
+          XML
+
+          cat > src/main/java/com/example/App.java <<'JAVA'
+          package com.example;
+          import org.apache.logging.log4j.LogManager;
+          import org.apache.logging.log4j.Logger;
+
+          public class App {
+              private static final Logger logger = LogManager.getLogger(App.class);
+              public static void main(String[] args) {
+                  logger.info("Iniciando aplicação de demonstração Log4j");
+                  // Log inofensivo (sem JNDI/payload)
+                  logger.warn("User-Agent: {}", System.getProperty("http.agent", "demo-agent"));
+                  System.out.println("OK");
+              }
+          }
+          JAVA
+
+      - name: Build (profile ${{ matrix.maven_profile }})
+        run: |
+          mvn -B -q -P${{ matrix.maven_profile }} -DskipTests package
+
+      - name: Descobrir versão do Log4j resolvida
+        id: deps
+        run: |
+          mvn -q -P${{ matrix.maven_profile }} -DincludeScope=runtime -DexcludeTransitive=false \
+            org.apache.maven.plugins:maven-dependency-plugin:3.6.1:tree | tee maven-deps-${{ matrix.scenario }}.txt
+          VERSION=$(grep -Eo 'org.apache.logging.log4j:log4j-core:[0-9.]+(-[A-Za-z0-9.]+)?' maven-deps-${{ matrix.scenario }}.txt | head -n1 | cut -d: -f3)
+          echo "version=$VERSION" >> $GITHUB_OUTPUT
+
+      - name: Rodar app (stdout)
+        run: |
+          mvn -q -P${{ matrix.maven_profile }} exec:java | tee run-${{ matrix.scenario }}.log || true
+
+      - name: Instalar Syft/Grype/Trivy
+        run: |
+          curl -sSfL https://raw.githubusercontent.com/anchore/syft/main/install.sh | sh -s -- -b /usr/local/bin
+          curl -sSfL https://raw.githubusercontent.com/anchore/grype/main/install.sh | sh -s -- -b /usr/local/bin
+          sudo apt-get update -y && sudo apt-get install -y trivy
+
+      - name: SBOM (Syft) — arquivo + confirmação em tela
+        run: |
+          syft packages dir:. -o spdx-json > sbom-syft-${{ matrix.scenario }}.spdx.json
+          echo "SBOM gerado: sbom-syft-${{ matrix.scenario }}.spdx.json"
+
+      - name: SCA com Grype — TABELA EM TELA
+        run: |
+          echo "===== GRYPE (tabela) — ${{ matrix.scenario }} ====="
+          grype dir:. -o table | tee grype-${{ matrix.scenario }}.table.txt || true
+          echo "----- Achados p/ Log4j (JSON auxiliar) -----"
+          grype dir:. -o json > grype-${{ matrix.scenario }}.json || true
+          jq -r '.matches[] | select(.artifact.name|test("log4j";"i")) | [.vulnerability.id, .artifact.name, .artifact.version, (.vulnerability.cvss[0].metrics.baseScore // ""), .vulnerability.severity] | @tsv' grype-${{ matrix.scenario }}.json || true
+
+      - name: Trivy FS — TABELA EM TELA (HIGH/CRITICAL)
+        run: |
+          echo "===== TRIVY (tabela) — ${{ matrix.scenario }} ====="
+          trivy fs --scanners vuln --severity HIGH,CRITICAL . | tee trivy-${{ matrix.scenario }}.txt || true
+
+      - name: OWASP Dependency-Check — artefatos (HTML/XML)
+        uses: dependency-check/Dependency-Check_Action@v4
+        with:
+          project: "log4j-lab-${{ matrix.scenario }}"
+          path: "."
+          format: "HTML,XML"
+          out: "dc-${{ matrix.scenario }}"
+        continue-on-error: true
+
+      - name: ✅ Painel final em tela
+        if: always()
+        run: |
+          echo ""
+          echo "=== RESUMO DO CENÁRIO: ${{ matrix.scenario }} ==="
+          echo "Log4j/Core detectado (Maven): ${{ steps.deps.outputs.version }}"
+          echo "Top achados GRYPE p/ log4j:"
+          jq -r '.matches[] | select(.artifact.name|test("log4j";"i")) | [.vulnerability.id, .artifact.name, .artifact.version, .vulnerability.severity] | @tsv' grype-${{ matrix.scenario }}.json || true
+          echo "Relatórios opcionais publicados como artefatos: SBOM (Syft) e Dependency-Check (HTML/XML)"
+
+      - name: Publicar Artefatos (opcional)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: "reports-${{ matrix.scenario }}"
+          path: |
+            maven-deps-${{ matrix.scenario }}.txt
+            run-${{ matrix.scenario }}.log
+            sbom-syft-${{ matrix.scenario }}.spdx.json
+            grype-${{ matrix.scenario }}.json
+            grype-${{ matrix.scenario }}.table.txt
+            trivy-${{ matrix.scenario }}.txt
+            dc-${{ matrix.scenario }}"
