@@ -1,4 +1,4 @@
-name: "🔍 Lab Log4j — tudo em um único YML (saída em tela)"
+name: "🔍 Lab Log4j — vetor JNDI & mitigação (saída em tela)"
 
 on:
   workflow_dispatch: {}
@@ -8,7 +8,7 @@ permissions:
 
 jobs:
   lab:
-    name: "${{ matrix.scenario }} — build & scan"
+    name: "${{ matrix.scenario }} — build & inspect"
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
@@ -16,21 +16,23 @@ jobs:
         include:
           - scenario: vulneravel
             maven_profile: vulneravel
+            log4j_version: "2.14.1"
           - scenario: corrigido
             maven_profile: corrigido
+            log4j_version: "2.17.1"
 
     steps:
-      - name: Checkout (repo pode estar vazio)
+      - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Setup Java 17 e Maven
+      - name: Setup Java 17 & Maven
         run: |
           sudo apt-get update -y
-          sudo apt-get install -y maven jq
+          sudo apt-get install -y maven jq unzip zip
           java -version || true
           mvn -v || true
 
-      - name: Criar arquivos do projeto (pom.xml e App.java)
+      - name: Criar projeto Java (pom.xml & App.java)
         run: |
           mkdir -p src/main/java/com/example
           cat > pom.xml <<'XML'
@@ -46,6 +48,7 @@ jobs:
               <maven.compiler.target>11</maven.compiler.target>
               <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
             </properties>
+
             <dependencies>
               <dependency>
                 <groupId>org.apache.logging.log4j</groupId>
@@ -58,6 +61,7 @@ jobs:
                 <version>${log4j.version}</version>
               </dependency>
             </dependencies>
+
             <build>
               <plugins>
                 <plugin>
@@ -70,6 +74,7 @@ jobs:
                 </plugin>
               </plugins>
             </build>
+
             <profiles>
               <profile>
                 <id>vulneravel</id>
@@ -95,10 +100,11 @@ jobs:
           public class App {
               private static final Logger logger = LogManager.getLogger(App.class);
               public static void main(String[] args) {
-                  logger.info("Iniciando aplicação de demonstração Log4j");
-                  // Log inofensivo (sem JNDI/payload)
-                  logger.warn("User-Agent: {}", System.getProperty("http.agent", "demo-agent"));
-                  System.out.println("OK");
+                  logger.info("Iniciando app de demonstração Log4j");
+                  // Mensagem com placeholder inofensivo (NÃO executa nada)
+                  String entrada = "${jndi:ldap://example.com/a}";
+                  logger.warn("Entrada recebida: {}", entrada);
+                  System.out.println("DONE");
               }
           }
           JAVA
@@ -107,71 +113,66 @@ jobs:
         run: |
           mvn -B -q -P${{ matrix.maven_profile }} -DskipTests package
 
-      - name: Descobrir versão do Log4j resolvida
+      - name: Mostrar versão Log4j resolvida
         id: deps
         run: |
           mvn -q -P${{ matrix.maven_profile }} -DincludeScope=runtime -DexcludeTransitive=false \
             org.apache.maven.plugins:maven-dependency-plugin:3.6.1:tree | tee maven-deps-${{ matrix.scenario }}.txt
           VERSION=$(grep -Eo 'org.apache.logging.log4j:log4j-core:[0-9.]+(-[A-Za-z0-9.]+)?' maven-deps-${{ matrix.scenario }}.txt | head -n1 | cut -d: -f3)
           echo "version=$VERSION" >> $GITHUB_OUTPUT
+          echo "==> Log4j/Core detectado: $VERSION"
 
-      - name: Rodar app (stdout)
+      - name: Inspecionar JndiLookup no JAR (presença do vetor)
         run: |
+          JAR=$(mvn -q -P${{ matrix.maven_profile }} -DincludeScope=runtime \
+                 org.apache.maven.plugins:maven-dependency-plugin:3.6.1:copy \
+                 -Dartifact=org.apache.logging.log4j:log4j-core:${{ matrix.log4j_version }}:jar \
+                 -DoutputDirectory=./target | grep -Eo 'target/log4j-core-.*\.jar' | tail -n1 || true)
+          echo "JAR copiado: $JAR"
+          unzip -l "$JAR" | grep -E "JndiLookup\\.class" && echo ">> JndiLookup PRESENTE (vetor existente)" || echo ">> JndiLookup AUSENTE (vetor mitigado)"
+
+      - name: Executar app "como está" (stdout)
+        run: |
+          echo "===== RUN (sem mitigação manual) — ${{ matrix.scenario }} ====="
           mvn -q -P${{ matrix.maven_profile }} exec:java | tee run-${{ matrix.scenario }}.log || true
 
-      - name: Instalar Syft/Grype/Trivy
+      - name: Mitigação manual (remover JndiLookup.class) e reexecutar
         run: |
-          curl -sSfL https://raw.githubusercontent.com/anchore/syft/main/install.sh | sh -s -- -b /usr/local/bin
-          curl -sSfL https://raw.githubusercontent.com/anchore/grype/main/install.sh | sh -s -- -b /usr/local/bin
-          sudo apt-get update -y && sudo apt-get install -y trivy
+          echo "===== Mitigando por remoção do JndiLookup.class ====="
+          ORIG_JAR="target/log4j-core-${{ matrix.log4j_version }}.jar"
+          cp "$ORIG_JAR" "target/log4j-core-${{ matrix.log4j_version }}-nojndi.jar"
+          zip -q -d "target/log4j-core-${{ matrix.log4j_version }}-nojndi.jar" 'org/apache/logging/log4j/core/lookup/JndiLookup.class' || true
+          echo "Reexecutando app com JAR mitigado no classpath..."
+          CP="$(mvn -q -P${{ matrix.maven_profile }} -Dexec.classpathScope=runtime \
+                 org.codehaus.mojo:exec-maven-plugin:3.1.0:exec -Dexec.executable=echo -Dexec.args='%classpath' | tail -n1)"
+          # Substitui o JAR original pelo mitigado no CP
+          CP2="${CP//$ORIG_JAR/target/log4j-core-${{ matrix.log4j_version }}-nojndi.jar}"
+          echo "Classpath ajustado."
+          java -cp "$CP2" com.example.App | tee run-${{ matrix.scenario }}-nojndi.log || true
 
-      - name: SBOM (Syft) — arquivo + confirmação em tela
-        run: |
-          syft packages dir:. -o spdx-json > sbom-syft-${{ matrix.scenario }}.spdx.json
-          echo "SBOM gerado: sbom-syft-${{ matrix.scenario }}.spdx.json"
-
-      - name: SCA com Grype — TABELA EM TELA
-        run: |
-          echo "===== GRYPE (tabela) — ${{ matrix.scenario }} ====="
-          grype dir:. -o table | tee grype-${{ matrix.scenario }}.table.txt || true
-          echo "----- Achados p/ Log4j (JSON auxiliar) -----"
-          grype dir:. -o json > grype-${{ matrix.scenario }}.json || true
-          jq -r '.matches[] | select(.artifact.name|test("log4j";"i")) | [.vulnerability.id, .artifact.name, .artifact.version, (.vulnerability.cvss[0].metrics.baseScore // ""), .vulnerability.severity] | @tsv' grype-${{ matrix.scenario }}.json || true
-
-      - name: Trivy FS — TABELA EM TELA (HIGH/CRITICAL)
-        run: |
-          echo "===== TRIVY (tabela) — ${{ matrix.scenario }} ====="
-          trivy fs --scanners vuln --severity HIGH,CRITICAL . | tee trivy-${{ matrix.scenario }}.txt || true
-
-      - name: OWASP Dependency-Check — artefatos (HTML/XML)
-        uses: dependency-check/Dependency-Check_Action@v4
-        with:
-          project: "log4j-lab-${{ matrix.scenario }}"
-          path: "."
-          format: "HTML,XML"
-          out: "dc-${{ matrix.scenario }}"
-        continue-on-error: true
-
-      - name: ✅ Painel final em tela
+      - name: ✅ Painel final (em tela)
         if: always()
         run: |
           echo ""
-          echo "=== RESUMO DO CENÁRIO: ${{ matrix.scenario }} ==="
-          echo "Log4j/Core detectado (Maven): ${{ steps.deps.outputs.version }}"
-          echo "Top achados GRYPE p/ log4j:"
-          jq -r '.matches[] | select(.artifact.name|test("log4j";"i")) | [.vulnerability.id, .artifact.name, .artifact.version, .vulnerability.severity] | @tsv' grype-${{ matrix.scenario }}.json || true
-          echo "Relatórios opcionais publicados como artefatos: SBOM (Syft) e Dependency-Check (HTML/XML)"
+          echo "=== RESUMO — Cenário: ${{ matrix.scenario }} ==="
+          echo "Log4j/Core: ${{ steps.deps.outputs.version }}"
+          echo "- Antes da mitigação (JndiLookup presente?):"
+          (unzip -l "target/log4j-core-${{ matrix.log4j_version }}.jar" | grep -q 'JndiLookup.class' && echo "  -> PRESENTE") || echo "  -> AUSENTE"
+          echo "- Depois da mitigação (JndiLookup removido?):"
+          (unzip -l "target/log4j-core-${{ matrix.log4j_version }}-nojndi.jar" | grep -q 'JndiLookup.class' && echo "  -> AINDA PRESENTE (falhou)" ) || echo "  -> REMOVIDO"
+          echo ""
+          echo "Saídas (trechos):"
+          echo "--- run-${{ matrix.scenario }}.log (sem mitigação) ---"; head -n 5 run-${{ matrix.scenario }}.log || true
+          echo "--- run-${{ matrix.scenario }}-nojndi.log (com mitigação) ---"; head -n 5 run-${{ matrix.scenario }}-nojndi.log || true
 
-      - name: Publicar Artefatos (opcional)
+      - name: Artefatos opcionais
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: "reports-${{ matrix.scenario }}"
+          name: "outputs-${{ matrix.scenario }}"
           path: |
             maven-deps-${{ matrix.scenario }}.txt
             run-${{ matrix.scenario }}.log
-            sbom-syft-${{ matrix.scenario }}.spdx.json
-            grype-${{ matrix.scenario }}.json
-            grype-${{ matrix.scenario }}.table.txt
-            trivy-${{ matrix.scenario }}.txt
-            dc-${{ matrix.scenario }}"
+            run-${{ matrix.scenario }}-nojndi.log
+            target/log4j-core-${{ matrix.log4j_version }}.jar
+            target/log4j-core-${{ matrix.log4j_version }}-nojndi.jar
