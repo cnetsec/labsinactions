@@ -1,4 +1,4 @@
-name: "🧪 Log4Shell — demo completa e segura (saída em tela, 1 YML)"
+name: "🧪 Log4Shell — comparativo vulnerável x corrigido (saída em tela)"
 
 on:
   workflow_dispatch: {}
@@ -15,8 +15,10 @@ jobs:
         include:
           - scenario: vulneravel
             LOG4J_VERSION: "2.14.1"
+            JVM_ARGS: "-Dlog4j2.formatMsgNoLookups=false"
           - scenario: corrigido
             LOG4J_VERSION: "2.17.1"
+            JVM_ARGS: "-Dlog4j2.enableJndi=false -Dlog4j2.enableJndiLookup=false -Dlog4j2.formatMsgNoLookups=true"
 
     steps:
       - name: Checkout
@@ -96,21 +98,21 @@ jobs:
           mvn -q -DskipTests -Dlog4j.version="${{ matrix.LOG4J_VERSION }}" package
           echo "==> log4j-core efetivo: ${{ matrix.LOG4J_VERSION }}"
 
-      - name: Checar vetor no JAR oficial (JndiLookup.class)
+      - name: Baixar JAR oficial e checar JndiLookup (vetor)
         run: |
           mkdir -p target/deps
           URL="https://repo1.maven.org/maven2/org/apache/logging/log4j/log4j-core/${{ matrix.LOG4J_VERSION }}/log4j-core-${{ matrix.LOG4J_VERSION }}.jar"
-          echo "Baixando: $URL"
           curl -fsSL "$URL" -o "target/deps/log4j-core-${{ matrix.LOG4J_VERSION }}.jar"
           JAR="target/deps/log4j-core-${{ matrix.LOG4J_VERSION }}.jar"
           (unzip -l "$JAR" | grep -q 'JndiLookup.class' \
             && echo ">> JndiLookup PRESENTE (vetor existe)") \
             || echo ">> JndiLookup AUSENTE (vetor removido/desativado)"
 
-      - name: Subir listener local (porta 1389)
+      - name: Subir listener local (porta 1389) — ${{ matrix.scenario }}
         run: |
-          (socat -v -d -d TCP-LISTEN:1389,reuseaddr,fork - 2>&1 | tee ldap-listener.log) &
-          echo $! > listener.pid
+          rm -f ldap-${{ matrix.scenario }}.log
+          (socat -v -d -d TCP-LISTEN:1389,reuseaddr,fork - 2>&1 | tee ldap-${{ matrix.scenario }}.log) &
+          echo $! > listener-${{ matrix.scenario }}.pid
           sleep 1
 
       - name: Executar app (input JNDI) — ${{ matrix.scenario }}
@@ -122,18 +124,18 @@ jobs:
             -Dexec.classpathScope=runtime \
             -Dlog4j.version="${{ matrix.LOG4J_VERSION }}" \
             org.codehaus.mojo:exec-maven-plugin:3.1.0:java \
-            -Dexec.jvmArgs='-Dlog4j2.formatMsgNoLookups=false' \
+            -Dexec.jvmArgs='${{ matrix.JVM_ARGS }}' \
             | tee app-run-${{ matrix.scenario }}.log
           echo "===== FIM DA EXECUÇÃO ====="
           sleep 2
 
-      - name: Encerrar listener e imprimir capturas
+      - name: Encerrar listener e imprimir capturas — ${{ matrix.scenario }}
         if: always()
         run: |
-          if [ -f listener.pid ]; then kill $(cat listener.pid) 2>/dev/null || true; fi
+          if [ -f listener-${{ matrix.scenario }}.pid ]; then kill $(cat listener-${{ matrix.scenario }}.pid) 2>/dev/null || true; fi
           echo "===== CAPTURA DO LISTENER — ${{ matrix.scenario }} ====="
-          if [ -s ldap-listener.log ]; then
-            grep -E "accepting connection|CONNECT|TCP" -n ldap-listener.log || head -n 80 ldap-listener.log || true
+          if [ -s ldap-${{ matrix.scenario }}.log ]; then
+            grep -E "accepting connection|CONNECT|TCP" -n ldap-${{ matrix.scenario }}.log || head -n 80 ldap-${{ matrix.scenario }}.log || true
           else
             echo "(vazio)"
           fi
@@ -144,8 +146,8 @@ jobs:
         run: |
           HAS_LOG=1; HAS_CONN=1
           grep -Eq '\$\{jndi:ldap://127\.0\.0\.1:1389/' app-run-${{ matrix.scenario }}.log && HAS_LOG=0 || true
-          grep -Eq 'accepting connection.*:1389' ldap-listener.log && HAS_CONN=0 || true
-          if [ "${{ matrix.LOG4J_VERSION }}" = "2.14.1" ]; then
+          grep -Eq 'accepting connection.*:1389' ldap-${{ matrix.scenario }}.log && HAS_CONN=0 || true
+          if [ "${{ matrix.scenario }}" = "vulneravel" ]; then
             if [ $HAS_LOG -eq 0 ] && [ $HAS_CONN -eq 0 ]; then
               echo "✅ Vulnerável: lookup JNDI foi tentado (conexão vista)"; exit 0
             else
@@ -166,4 +168,4 @@ jobs:
           name: "outputs-${{ matrix.scenario }}"
           path: |
             app-run-${{ matrix.scenario }}.log
-            ldap-listener.log
+            ldap-${{ matrix.scenario }}.log
