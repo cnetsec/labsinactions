@@ -21,7 +21,7 @@ jobs:
       - name: Setup ambiente (Java/Maven + utilitários)
         run: |
           sudo apt-get update -y
-          sudo apt-get install -y maven jq socat unzip
+          sudo apt-get install -y maven jq socat unzip curl
           java -version
           mvn -v
           socat -V || true
@@ -98,12 +98,12 @@ jobs:
           mvn -q -DskipTests -Dlog4j.version="${LOG4J_VERSION}" package
           echo "==> log4j-core efetivo: ${LOG4J_VERSION}"
 
-      - name: Confirmar presença do vetor (copiar JAR e inspecionar JndiLookup.class)
+      - name: Confirmar presença do vetor (baixar JAR direto do Maven Central)
         run: |
-          # Em vez de dependency:get (que tenta puxar 'log4j-core-java9'), copiamos só o JAR alvo:
-          mvn -q org.apache.maven.plugins:maven-dependency-plugin:3.6.1:copy \
-              -Dartifact=org.apache.logging.log4j:log4j-core:${LOG4J_VERSION}:jar \
-              -DoutputDirectory=./target/deps
+          mkdir -p target/deps
+          URL="https://repo1.maven.org/maven2/org/apache/logging/log4j/log4j-core/${LOG4J_VERSION}/log4j-core-${LOG4J_VERSION}.jar"
+          echo "Baixando: $URL"
+          curl -fsSL "$URL" -o "target/deps/log4j-core-${LOG4J_VERSION}.jar"
           JAR="target/deps/log4j-core-${LOG4J_VERSION}.jar"
           echo "JAR: $JAR"
           (unzip -l "$JAR" | grep -q 'JndiLookup.class' && echo ">> JndiLookup PRESENTE (vetor existe)") || echo ">> JndiLookup AUSENTE"
