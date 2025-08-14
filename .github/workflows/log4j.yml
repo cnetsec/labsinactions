@@ -1,4 +1,4 @@
-name: "🧪 Lab Log4Shell — ataque controlado (saída em tela, tudo em 1 YML)"
+name: "🧪 Log4Shell — cenário vulnerável (saída em tela)"
 
 on:
   workflow_dispatch: {}
@@ -7,23 +7,18 @@ permissions:
   contents: read
 
 jobs:
-  demo:
-    name: "${{ matrix.scenario }} — execução e evidência em tela"
+  vulneravel:
+    name: "Vulnerável — execução e evidência em tela"
     runs-on: ubuntu-latest
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - scenario: vulneravel
-            log4j_version: "2.14.1"   # vulnerável (JNDI ativo)
-          - scenario: corrigido
-            log4j_version: "2.17.1"   # corrigido (JNDI desativado)
+
+    env:
+      LOG4J_VERSION: "2.14.1"
 
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Setup ambiente (Java/Maven + ferramentas de rede)
+      - name: Setup ambiente (Java/Maven + utilitários)
         run: |
           sudo apt-get update -y
           sudo apt-get install -y maven jq socat unzip
@@ -83,32 +78,33 @@ jobs:
               private static final Logger logger = LogManager.getLogger(App.class);
 
               public static void main(String[] args) {
-                  // Entrada com marcador JNDI (demonstra lookup sem executar payload)
-                  String entrada = System.getenv().getOrDefault("LOG_INPUT",
-                          "${jndi:ldap://127.0.0.1:1389/a}");
+                  // Entrada com marcador JNDI (demonstra lookup; sem payload algum)
+                  String entrada = System.getenv().getOrDefault(
+                      "LOG_INPUT",
+                      "${jndi:ldap://127.0.0.1:1389/a}"
+                  );
 
                   logger.info("Iniciando app Log4j (demo segura).");
-                  // Versões vulneráveis tentam resolver JNDI ao formatar esta mensagem:
-                  logger.error("Processando campo: {}", entrada);
+                  //Mensagem DIRETA (não usar "{}") para acionar o lookup em 2.14.1
+                  logger.error(entrada);
 
                   System.out.println("APP_DONE");
               }
           }
           JAVA
 
-      - name: Montar projeto com a versão ${{ matrix.log4j_version }}
+      - name: Build (Log4j 2.14.1)
         run: |
-          mvn -q -DskipTests -Dlog4j.version=${{ matrix.log4j_version }} package
-          echo "==> Versão efetiva do log4j-core: ${{ matrix.log4j_version }}"
+          mvn -q -DskipTests -Dlog4j.version="${LOG4J_VERSION}" package
+          echo "==> log4j-core efetivo: ${LOG4J_VERSION}"
 
       - name: (Opcional) Confirmar presença do vetor JndiLookup.class
         run: |
-          # IMPORTANTE: passar -Dlog4j.version aqui também, senão Maven falha ao ler o POM.
-          mvn -q -Dlog4j.version=${{ matrix.log4j_version }} \
-              dependency:get -Dartifact=org.apache.logging.log4j:log4j-core:${{ matrix.log4j_version }}:jar
-          JAR_PATH="$HOME/.m2/repository/org/apache/logging/log4j/log4j-core/${{ matrix.log4j_version }}/log4j-core-${{ matrix.log4j_version }}.jar"
-          echo "JAR: $JAR_PATH"
-          (unzip -l "$JAR_PATH" | grep -q 'JndiLookup.class' && echo ">> JndiLookup PRESENTE (vetor existe)") || echo ">> JndiLookup AUSENTE (vetor removido/desativado)"
+          mvn -q -Dlog4j.version="${LOG4J_VERSION}" \
+              dependency:get -Dartifact=org.apache.logging.log4j:log4j-core:${LOG4J_VERSION}:jar
+          JAR="$HOME/.m2/repository/org/apache/logging/log4j/log4j-core/${LOG4J_VERSION}/log4j-core-${LOG4J_VERSION}.jar"
+          echo "JAR: $JAR"
+          (unzip -l "$JAR" | grep -q 'JndiLookup.class' && echo ">> JndiLookup PRESENTE (vetor existe)") || echo ">> JndiLookup AUSENTE"
 
       - name: Subir listener local (porta 1389) para evidenciar conexão
         run: |
@@ -117,42 +113,45 @@ jobs:
           echo $! > listener.pid
           sleep 1
 
-      - name: Executar app com input JNDI (cenário ${{ matrix.scenario }})
+      - name: Executar app com input JNDI (vulnerável)
         env:
-          LOG_INPUT: "${jndi:ldap://127.0.0.1:1389/a}"
+          LOG_INPUT: '${jndi:ldap://127.0.0.1:1389/a}'   # aspas simples mantêm literal
         run: |
-          echo "===== EXECUTANDO APP (${{ matrix.scenario }}) ====="
-          mvn -q -Dexec.classpathScope=runtime -Dlog4j.version=${{ matrix.log4j_version }} \
-            org.codehaus.mojo:exec-maven-plugin:3.1.0:java | tee app-run-${{ matrix.scenario }}.log
+          echo "===== EXECUTANDO APP (vulneravel) ====="
+          mvn -q \
+            -Dexec.classpathScope=runtime \
+            -Dlog4j.version="${LOG4J_VERSION}" \
+            org.codehaus.mojo:exec-maven-plugin:3.1.0:java \
+            -Dexec.jvmArgs='-Dlog4j2.formatMsgNoLookups=false' \
+            | tee app-run-vulneravel.log
           echo "===== FIM DA EXECUÇÃO ====="
           sleep 3
-          kill -0 $(cat listener.pid) 2>/dev/null && echo "Listener ainda ativo." || echo "Listener já encerrou."
 
-      - name: Encerrar listener e imprimir capturas
+      - name: Encerrar listener e imprimir capturas (prova em tela)
         if: always()
         run: |
           if [ -f listener.pid ]; then
             kill $(cat listener.pid) 2>/dev/null || true
           fi
           echo ""
-          echo "===== CAPTURA DO LISTENER (porta 1389) — ${{ matrix.scenario }} ====="
+          echo "===== CAPTURA DO LISTENER (porta 1389) — vulneravel ====="
           if [ -s ldap-listener.log ]; then
-            # Mostra amostra de linhas significativas
-            grep -E "CONNECT|bytes|length|TCP" -n ldap-listener.log || head -n 50 ldap-listener.log || true
+            # Mostra linhas mais úteis; comente o grep para ver tudo
+            grep -E "CONNECT|bytes|length|TCP" -n ldap-listener.log || head -n 80 ldap-listener.log || true
             echo ">> RESULTADO: Conexão JNDI FOI TENTADA (lookup disparado)."
           else
             echo "(vazio)"
-            echo ">> RESULTADO: Nenhuma conexão ao listener — sem lookup (versão corrigida / JNDI desativado)."
+            echo ">> RESULTADO: Nenhuma conexão registrada — verifique os passos anteriores."
           fi
           echo ""
-          echo "===== TRECHO DO LOG DA APLICAÇÃO — ${{ matrix.scenario }} ====="
-          (grep -E "\\$\\{jndi" -n app-run-${{ matrix.scenario }}.log || head -n 20 app-run-${{ matrix.scenario }}.log) 2>/dev/null || true
+          echo "===== TRECHO DO LOG DA APLICAÇÃO ====="
+          (grep -E "\$\{jndi" -n app-run-vulneravel.log || head -n 20 app-run-vulneravel.log) 2>/dev/null || true
 
       - name: Artefatos (opcional)
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: "outputs-${{ matrix.scenario }}"
+          name: "outputs-vulneravel"
           path: |
-            app-run-${{ matrix.scenario }}.log
+            app-run-vulneravel.log
             ldap-listener.log
