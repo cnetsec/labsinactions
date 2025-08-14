@@ -1,0 +1,179 @@
+name: CSRF Demo — vulnerável vs corrigido
+
+on:
+  workflow_dispatch: {}
+
+jobs:
+  csrf_demo:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: 🐍 Setup Python
+        run: |
+          python -V
+          pip install --upgrade pip
+          pip install flask
+
+      - name: 📄 Escrever apps (vulnerável e corrigido)
+        run: |
+          set -euo pipefail
+
+          # --- Vulnerável (sem CSRF, sem validação de origem) ---
+          cat > app_vuln.py << 'PY'
+          from flask import Flask, request, render_template_string, make_response
+          app = Flask(__name__)
+          app.secret_key = "dev"
+
+          @app.after_request
+          def add_cookie(resp):
+              # Cookie de sessão enviado cross-site (SameSite=None)
+              resp.set_cookie("session", "sess123", httponly=True, secure=True, samesite="None")
+              return resp
+
+          FORM = """
+          <h1>Alterar e-mail (vulnerável)</h1>
+          <form method="POST" action="/conta/email">
+            <input name="email" value="novo@exemplo.com">
+            <button type="submit">Salvar</button>
+          </form>
+          """
+
+          @app.get("/")
+          def index():
+              return render_template_string(FORM)
+
+          @app.post("/conta/email")
+          def change_email():
+              novo = request.form.get("email","")
+              return f"VULN: email alterado para: {novo}", 200
+
+          if __name__ == "__main__":
+              app.run(port=5000, debug=False, host="127.0.0.1")
+          PY
+
+          # --- Corrigido (token CSRF obrigatório; SameSite=Lax) ---
+          cat > app_fixed.py << 'PY'
+          from flask import Flask, request, render_template_string, session, abort
+          import secrets, hmac
+          app = Flask(__name__)
+          app.secret_key = "dev"
+          ALLOWED_ORIGIN = "http://127.0.0.1:5001"
+
+          @app.after_request
+          def secure_cookies(resp):
+              resp.set_cookie("session", "sessABC", httponly=True, secure=True, samesite="Lax")
+              resp.headers["X-Content-Type-Options"] = "nosniff"
+              resp.headers["X-Frame-Options"] = "DENY"
+              resp.headers["Referrer-Policy"] = "same-origin"
+              return resp
+
+          def get_csrf():
+              if "csrf" not in session:
+                  session["csrf"] = secrets.token_urlsafe(32)
+              return session["csrf"]
+
+          def check_csrf(token_form):
+              token = session.get("csrf")
+              return bool(token and token_form and hmac.compare_digest(token, token_form))
+
+          # Valida origem apenas se fornecida (curl não envia por padrão).
+          def check_origin_if_present():
+              origin = request.headers.get("Origin")
+              if origin and origin != ALLOWED_ORIGIN:
+                  abort(403, "Origem inválida")
+
+          FORM = """
+          <h1>Alterar e-mail (corrigido)</h1>
+          <form method="POST" action="/conta/email">
+            <input name="email" value="seguro@exemplo.com">
+            <input type="hidden" name="csrf_token" value="{{ csrf }}">
+            <button type="submit">Salvar</button>
+          </form>
+          """
+
+          from flask import render_template_string
+          @app.get("/")
+          def index():
+              return render_template_string(FORM, csrf=get_csrf())
+
+          @app.post("/conta/email")
+          def change_email():
+              check_origin_if_present()
+              if not check_csrf(request.form.get("csrf_token")):
+                  abort(403, "Token CSRF inválido")
+              novo = request.form.get("email","")
+              return f"FIXED: email alterado para: {novo}", 200
+
+          if __name__ == "__main__":
+              # Config cookie de sessão segura
+              app.config.update(
+                  SESSION_COOKIE_SECURE=True,
+                  SESSION_COOKIE_HTTPONLY=True,
+                  SESSION_COOKIE_SAMESITE="Lax",
+              )
+              app.run(port=5001, debug=False, host="127.0.0.1")
+          PY
+
+      - name: ❌ Não corrigido (vulnerável) — POST sem token funciona
+        run: |
+          set -euo pipefail
+
+          # Sobe o app vulnerável em background
+          python app_vuln.py & echo $! > vuln.pid
+          # Aguarda subir
+          for i in $(seq 1 20); do
+            curl -sf http://127.0.0.1:5000/ >/dev/null && break || sleep 0.5
+          done
+
+          # Usa cookie jar para simular sessão do usuário logado
+          CJ="cj_vuln.txt"
+          # 1) Visita a página (recebe cookie)
+          curl -sS -c "$CJ" http://127.0.0.1:5000/ >/dev/null
+
+          # 2) Envia POST SEM token CSRF (ataque CSRF teria o navegador enviando cookies)
+          echo "---- POST sem token (esperado: 200) ----"
+          curl -sS -b "$CJ" -o /tmp/resp_vuln.txt -w "code=%{http_code}\n" \
+            -X POST -d "email=attacker@evil.com" http://127.0.0.1:5000/conta/email
+
+          echo "---- Corpo de resposta (trecho) ----"
+          head -n 1 /tmp/resp_vuln.txt
+
+          # Encerra servidor
+          kill "$(cat vuln.pid)" || true
+
+      - name: ✅ Corrigido — bloqueia sem token e aceita com token válido
+        run: |
+          set -euo pipefail
+
+          python app_fixed.py & echo $! > fixed.pid
+          for i in $(seq 1 20); do
+            curl -sf http://127.0.0.1:5001/ >/dev/null && break || sleep 0.5
+          done
+
+          CJ="cj_fixed.txt"
+
+          # 1) Pega sessão (cookie) e captura o HTML com o token
+          curl -sS -c "$CJ" http://127.0.0.1:5001/ -o /tmp/form.html
+
+          # 2) Tenta POST SEM token -> deve falhar (403)
+          echo "---- POST sem token (esperado: 403) ----"
+          curl -sS -b "$CJ" -o /tmp/resp_no_token.txt -w "code=%{http_code}\n" \
+            -X POST -d "email=blocked@evil.com" http://127.0.0.1:5001/conta/email || true
+          head -n 1 /tmp/resp_no_token.txt || true
+
+          # 3) Extrai token do HTML e faz POST com token + Origin correto -> 200
+          CSRF_TOKEN="$(grep -oP 'name="csrf_token" value="\K[^"]+' /tmp/form.html)"
+          echo "CSRF_TOKEN capturado: ${CSRF_TOKEN:0:8}..."
+
+          echo "---- POST com token + Origin válido (esperado: 200) ----"
+          curl -sS -b "$CJ" -o /tmp/resp_ok.txt -w "code=%{http_code}\n" \
+            -H 'Origin: http://127.0.0.1:5001' \
+            -X POST \
+            -d "email=seguro@exemplo.com" \
+            -d "csrf_token=$CSRF_TOKEN" \
+            http://127.0.0.1:5001/conta/email
+
+          head -n 1 /tmp/resp_ok.txt
+
+          # Encerra servidor
+          kill "$(cat fixed.pid)" || true
